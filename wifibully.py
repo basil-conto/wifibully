@@ -1,11 +1,13 @@
 #!/usr/bin/env python2
 
-from parse_args import parse_args
-from subprocess import Popen, PIPE
 import csv
 import re
 import sys
 import time
+from subprocess import Popen, PIPE
+
+from parse_args import parse_args
+
 
 args = None
 attack_clients = []
