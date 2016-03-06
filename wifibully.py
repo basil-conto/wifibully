@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python2
 
 from parse_args import parse_args
 from subprocess import Popen, PIPE
